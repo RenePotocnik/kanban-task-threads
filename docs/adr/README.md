@@ -29,6 +29,7 @@ even when it supersedes an old one.
 | [0013](0013-every-profile-is-a-candidate.md) | Every profile that loads the plugin is a lease candidate; the thread waits before it builds |
 | [0014](0014-publisher-profile-and-metadata-reconciliation.md) | Optional publisher pinning and bounded Discord metadata reconciliation |
 | [0015](0015-static-avatar-assets.md) | Explicit operator-hosted static Phosphor assets; no mutable upstream hotlinks or hidden uploads |
+| [0016](0016-fold-children-into-hub-thread.md) | Opt-in `fold_children`: a task that gates an epic publishes into the epic's thread instead of opening its own |
 
 Historical note: ADRs 0001–0007 were extracted from the original design
 document (2026-09-18, revised after two adversarial reviews with every

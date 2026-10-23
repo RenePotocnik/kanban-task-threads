@@ -97,6 +97,7 @@ class StateStore:
             "ALTER TABLE posts ADD COLUMN last_tag TEXT",
             "ALTER TABLE posts ADD COLUMN last_name TEXT",
             "ALTER TABLE posts ADD COLUMN thread_archived INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE posts ADD COLUMN owner_task_id TEXT",  # ADR-0016: folded child → hub
             "ALTER TABLE leases ADD COLUMN token INTEGER NOT NULL DEFAULT 0",
         ):
             try:
@@ -201,8 +202,11 @@ class StateStore:
     def complete_create(
         self, board: str, task_id: str, *, thread_id: str, message_id: str, destination: str
     ) -> None:
+        # owner_task_id = self: an unambiguous marker distinguishing owner rows
+        # from folded children (ADR-0016), which copy the hub's thread ids.
         self._conn.execute(
             "UPDATE posts SET thread_id = ?, message_id = ?, destination = ?, "
+            "owner_task_id = task_id, "
             "pending_create_at = NULL WHERE board = ? AND task_id = ?",
             (thread_id, message_id, destination, board, task_id),
         )
@@ -212,6 +216,39 @@ class StateStore:
             "UPDATE posts SET pending_create_at = NULL WHERE board = ? AND task_id = ?",
             (board, task_id),
         )
+
+    def attach_folded(
+        self,
+        board: str,
+        task_id: str,
+        *,
+        thread_id: str,
+        message_id: str,
+        destination: str,
+        owner_task_id: str,
+        state: str = "live",
+        detail: str | None = None,
+    ) -> None:
+        """Point a folded child (ADR-0016) at the hub's thread. No card of its
+        own: `message_id` is the hub's card, used only for reply anchors — the
+        child's row is never `edit_card`ed, tagged, or archived. Plain INSERT:
+        the row cannot pre-exist (a task is folded, or self-published, the
+        first time it is seen), so a conflict is a real invariant break."""
+        self._conn.execute(
+            "INSERT INTO posts (board, task_id, thread_id, message_id, destination, "
+            "state, detail, owner_task_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (board, task_id, thread_id, message_id, destination, state, detail, owner_task_id),
+        )
+
+    def owner_of(self, board: str, task_id: str) -> str | None:
+        """The task that owns task_id's thread: itself, or the hub when the row
+        is a folded child (ADR-0016). None when there is no row."""
+        row = self._conn.execute(
+            "SELECT owner_task_id FROM posts WHERE board = ? AND task_id = ?", (board, task_id)
+        ).fetchone()
+        if row is None:
+            return None
+        return row["owner_task_id"] or task_id
 
     def mark_tombstone(self, board: str, task_id: str, detail: str) -> None:
         self._set_state(board, task_id, "tombstone", detail)
@@ -249,6 +286,21 @@ class StateStore:
             for row in self._conn.execute(
                 "SELECT * FROM posts WHERE board = ? AND state = 'live' "
                 "AND thread_id IS NOT NULL ORDER BY task_id",
+                (board,),
+            )
+        ]
+
+    def owner_posts(self, board: str) -> list[dict]:
+        """Like `live_posts`, minus folded children (ADR-0016): they share the
+        hub's `thread_id`, so a thread-keyed map would collide. NULL-owner
+        rows are legacy owner rows (pre-ADR-0016 deployments)."""
+        return [
+            dict(row)
+            for row in self._conn.execute(
+                "SELECT * FROM posts WHERE board = ? AND state = 'live' "
+                "AND thread_id IS NOT NULL "
+                "AND (owner_task_id IS NULL OR owner_task_id = task_id) "
+                "ORDER BY task_id",
                 (board,),
             )
         ]

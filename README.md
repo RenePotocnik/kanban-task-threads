@@ -123,6 +123,7 @@ All optional, under `plugins.entries.<id>.settings`:
 | `stale_after_seconds` | `600` | Heartbeat age after which a running task renders as stale |
 | `dashboard_url` | — | Task page URL; may contain `{task_id}` and `{board}`. Powers the card link and each reply's trailing `[#]` (without it, `[#]` jumps to the card in-app). **Links are forever**: every URL you publish is frozen in Discord permanently, so use a stable *name* that resolves from every device you click from — never an IP (the plugin warns on literal IPs), never anything discovered at boot |
 | `comment_excerpt_chars` | `180` | Comment text quoted in replies; `0` = author only |
+| `fold_children` | `false` | A task that gates an epic publishes its updates into the epic's thread instead of opening its own — replies are prefixed with the child's title, and the card/tag/archive follow the epic (ADR-0016) |
 | `card_template`, `reply_templates` | built-ins | Cosmetic templates ([docs/configuration.md](docs/configuration.md)) |
 
 Templates are rendered through a restricted formatter (flat fields only —

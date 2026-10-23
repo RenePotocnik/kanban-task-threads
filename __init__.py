@@ -302,6 +302,7 @@ def _build_consumer(ctx):
         card_template=ctx.get_config("card_template"),
         reply_templates=ctx.get_config("reply_templates") or {},
         comment_excerpt_chars=int(ctx.get_config("comment_excerpt_chars", 180) or 0),
+        fold_children=bool(ctx.get_config("fold_children", False)),
         guild_id=str(info.get("guild_id") or ""),
         **kwargs,
     )

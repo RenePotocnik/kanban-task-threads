@@ -96,6 +96,13 @@ config_schema:
     description: >-
       Maximum comment characters published in replies. Set to 0 for author-only
       replies.
+  fold_children:
+    type: bool
+    default: false
+    description: >-
+      Publish a task's updates into the thread of the single epic it gates
+      instead of opening its own thread (ADR-0016). Off keeps
+      one-thread-per-task.
   card_template:
     type: str
     description: Card body template. Falls back to the built-in on any error.

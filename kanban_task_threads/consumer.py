@@ -123,6 +123,7 @@ class Consumer:
         reply_templates: dict | None = None,
         comment_excerpt_chars: int = 180,
         guild_id: str = "",
+        fold_children: bool = False,
     ):
         self._board_db_path = str(board_db_path)
         self._store = store
@@ -139,6 +140,7 @@ class Consumer:
         self._reply_templates = reply_templates or {}
         self._comment_excerpt_chars = comment_excerpt_chars
         self._guild_id = guild_id
+        self._fold_children = fold_children
         # Discord metadata is external truth. These are deliberately private,
         # process-local scheduling hints — never schema, queue, or durable state.
         self._next_metadata_audit_at = 0
@@ -267,6 +269,49 @@ class Consumer:
         post = self._store.get_post(self._board, task_id)
         return post["last_event_id"] if post else 0
 
+    def _fold_target(self, conn, task_id: str) -> str | None:
+        """ADR-0016: the single topmost dependent of task_id's fan-out — the
+        epic thread its updates land in — or None: fold_children off, the task
+        gates nothing, multiple topmost dependents (a shared fan-in would
+        duplicate replies into several threads), a cycle, or the hub is gone
+        from the board (a deleted hub must not pin the task's cursor)."""
+        if not self._fold_children:
+            return None
+        # BFS over dependents (task_links.child_id); the topmost nodes are the
+        # ones gating nothing. Exactly one of those, and not the task itself,
+        # is a fold target.
+        seen = {task_id}
+        frontier = [task_id]
+        topmost: set = set()
+        while frontier:
+            current = frontier.pop()
+            children = [
+                row["child_id"]
+                for row in conn.execute(
+                    "SELECT child_id FROM task_links WHERE parent_id = ?", (current,)
+                )
+            ]
+            if not children:
+                topmost.add(current)
+                continue
+            for child in children:
+                if child in seen:
+                    return None  # cycle: the board is deadlocked anyway — don't guess
+                seen.add(child)
+                frontier.append(child)
+        if len(topmost) == 1 and task_id not in topmost:
+            hub = next(iter(topmost))
+            if conn.execute("SELECT id FROM tasks WHERE id = ?", (hub,)).fetchone():
+                return hub
+        return None
+
+    def _dirty_card_for(self, task_id: str, post: dict | None) -> None:
+        """Card-dirty vehicle for a (possibly folded) row (ADR-0016): a folded
+        child has no card, so the flag lands on the owner's row — a dirty
+        child row would repaint nothing and just clear itself in _repaint."""
+        owner = (post or {}).get("owner_task_id")
+        self._store.set_card_dirty(self._board, owner or task_id, True)
+
     def _process_task(
         self, conn, task_id: str, events, batch_max: int, now: int, report: Report
     ) -> int:
@@ -307,30 +352,79 @@ class Consumer:
         card = render_card(view, template=self._card_template)
 
         # -- ensure the post exists ------------------------------------------
+        # ADR-0016: with fold_children on, a task that gates an epic publishes
+        # into the epic's thread — no card of its own, no maintenance of its
+        # own. `folded` is recomputed from the row: the attach for
+        # this task may have happened in a prior pass.
+        folded = bool(post and post["owner_task_id"] not in (None, task_id))
         opened = False
         if post is None or post["thread_id"] is None:
-            thread_name = render_thread_name(task_row["title"] or "", task_id)
-            store.begin_create(board, task_id, now=now)
-            try:
-                ref = self._transport.open_thread(title=thread_name, card=card)
-            except TransportError as err:
-                return self._create_failed_known(task_id, err, now, report, batch_max)
-            except Exception as exc:
-                # Response lost: unknown outcome, recorded, never blindly retried.
-                report.errors.append(f"{task_id}: create outcome unknown: {exc!r}")
-                return self._position_of(task_id)
-            store.complete_create(
-                board,
-                task_id,
-                thread_id=ref.thread_id,
-                message_id=ref.message_id,
-                destination=self._destination,
-            )
-            store.set_thread_state(board, task_id, name=thread_name)
-            report.opened.append(task_id)
-            self._announce_to_dependents(conn, task_id, task_row, ref, report)
-            opened = True
-            pos = self._position_of(task_id)
+            hub_id = self._fold_target(conn, task_id)
+            if hub_id is None:
+                thread_name = render_thread_name(task_row["title"] or "", task_id)
+                store.begin_create(board, task_id, now=now)
+                try:
+                    ref = self._transport.open_thread(title=thread_name, card=card)
+                except TransportError as err:
+                    return self._create_failed_known(task_id, err, now, report, batch_max)
+                except Exception as exc:
+                    # Response lost: unknown outcome, recorded, never blindly retried.
+                    report.errors.append(f"{task_id}: create outcome unknown: {exc!r}")
+                    return self._position_of(task_id)
+                store.complete_create(
+                    board,
+                    task_id,
+                    thread_id=ref.thread_id,
+                    message_id=ref.message_id,
+                    destination=self._destination,
+                )
+                store.set_thread_state(board, task_id, name=thread_name)
+                report.opened.append(task_id)
+                self._announce_to_dependents(conn, task_id, task_row, ref, report)
+                opened = True
+                pos = self._position_of(task_id)
+            else:
+                # Folded child (ADR-0016): the hub's thread IS the post.
+                # The hub is the topmost dependent — by definition it always
+                # self-publishes — so a missing hub row means "not yet", not
+                # "never": hold and re-scan these events next pass. In a
+                # decompose the children's `created` events carry lower ids
+                # than the root's `decomposed` event, so the case is real.
+                hub_post = store.get_post(board, hub_id)
+                if hub_post is None or hub_post["thread_id"] is None:
+                    if hub_post is not None and hub_post["pending_create_at"] is not None:
+                        report.errors.append(
+                            f"{task_id}: hub {hub_id} create outcome unknown since "
+                            f"{hub_post['pending_create_at']}; holding"
+                        )
+                    return self._position_of(task_id)
+                if hub_post["state"] in ("tombstone", "dead_letter"):
+                    store.attach_folded(
+                        board,
+                        task_id,
+                        thread_id=hub_post["thread_id"],
+                        message_id=hub_post["message_id"],
+                        destination=hub_post["destination"] or self._destination,
+                        owner_task_id=hub_id,
+                        state=hub_post["state"],
+                        detail=f"hub {hub_id} post is {hub_post['state']}",
+                    )
+                    report.errors.append(
+                        f"{task_id}: folded into {hub_id}, whose post is "
+                        f"{hub_post['state']} — not publishing"
+                    )
+                    return batch_max
+                store.attach_folded(
+                    board,
+                    task_id,
+                    thread_id=hub_post["thread_id"],
+                    message_id=hub_post["message_id"],
+                    destination=hub_post["destination"] or self._destination,
+                    owner_task_id=hub_id,
+                )
+                ref = ThreadRef(thread_id=hub_post["thread_id"], message_id=hub_post["message_id"])
+                pos = self._position_of(task_id)
+                folded = True
         else:
             ref = ThreadRef(thread_id=post["thread_id"], message_id=post["message_id"])
             pos = post["last_event_id"]
@@ -356,9 +450,16 @@ class Consumer:
                             if template is None:
                                 template = COMMENTED_EXCERPT_TEMPLATE
                     if not suppress:
-                        content = self._with_anchor(
-                            render_reply(row["kind"], payload, template=template), ref, task_id
-                        )
+                        base = render_reply(row["kind"], payload, template=template)
+                        if folded:
+                            # Several children share the hub's thread: the reply
+                            # must say which one spoke (ADR-0016). The [#] anchor
+                            # still deep-links to this task's own page.
+                            base = truncate(
+                                f"▸ {task_row['title'] or task_id} · {task_id}\n{base}",
+                                CONTENT_LIMIT - 120,
+                            )
+                        content = self._with_anchor(base, ref, task_id)
                         username = reply_username(row["kind"], payload, task_row["assignee"])
                         self._transport.append(
                             ref,
@@ -372,9 +473,13 @@ class Consumer:
             report.replied += replied
             # Refresh the card when something actually happened — or when a
             # prior failure left it dirty. A pinned-cursor rescan with no new
-            # events must cost zero Discord traffic.
+            # events must cost zero Discord traffic. A folded child has no
+            # card of its own (ADR-0016): the hub's rollup is the card, and
+            # the dependent-dirty pass below is what repaints it.
             progressed = pos > start_pos
-            if replied or (not opened and (progressed or (post and post["card_dirty"]))):
+            if not folded and (
+                replied or (not opened and (progressed or (post and post["card_dirty"])))
+            ):
                 self._transport.edit_card(ref, card)
                 self._store.set_card_dirty(board, task_id, False)
                 report.edited.append(task_id)
@@ -384,15 +489,19 @@ class Consumer:
             return self._publish_failed(task_id, err, now, report, batch_max, pos)
         except Exception as exc:
             report.replied += replied
-            self._store.set_card_dirty(board, task_id, True)
+            self._dirty_card_for(task_id, store.get_post(board, task_id))
             report.warnings.append(f"{task_id}: publish failed, will retry: {exc!r}")
             return pos
         if opened or replied or edited:
-            self._maintain_thread(task_id, ref, view, report)
+            if not folded:
+                # The card's out-of-band properties follow the card's owner;
+                # a folded child has none to maintain (ADR-0016).
+                self._maintain_thread(task_id, ref, view, report)
             # The epic hub (ADR-0012): progress on a prerequisite stales its
             # dependents' rollups; the dirty-repaint machinery repaints them.
-            # Gated on actual progress: a pinned-cursor rescan must not
-            # re-dirty dependents every pass.
+            # For a folded child the dependent IS the hub — this is what
+            # repaints the shared card. Gated on actual progress: a
+            # pinned-cursor rescan must not re-dirty dependents every pass.
             for dependent_id in self._dependent_ids(conn, task_id):
                 dep_post = store.get_post(board, dependent_id)
                 if dep_post and dep_post["state"] == "live":
@@ -456,6 +565,9 @@ class Consumer:
         for dependent_id in self._dependent_ids(conn, task_id):
             post = self._store.get_post(self._board, dependent_id)
             if not (post and post["state"] == "live" and post["thread_id"]):
+                continue
+            if post.get("owner_task_id") == task_id:
+                # Folded into THIS thread (ADR-0016): a link reply to itself.
                 continue
             self._store.set_card_dirty(self._board, dependent_id, True)
             try:
@@ -564,7 +676,9 @@ class Consumer:
         patched = False
         try:
             actual_threads = self._transport.list_forum_threads(self._guild_id)
-            owned = {post["thread_id"]: post for post in self._store.live_posts(self._board)}
+            # Owner rows only (ADR-0016): folded children share the hub's
+            # thread_id and would collide in the thread-keyed map.
+            owned = {post["thread_id"]: post for post in self._store.owner_posts(self._board)}
             for thread_id, actual in actual_threads.items():
                 post = owned.get(thread_id)
                 if post is None:
@@ -729,6 +843,11 @@ class Consumer:
         re-render from the row and PATCH again."""
         now = self._now()
         post = self._store.get_post(self._board, task_id)
+        if post and post.get("owner_task_id") not in (None, task_id):
+            # Folded child (ADR-0016): no card of its own to repaint — the
+            # hub's rollup repaints on the owner's row. Clear the vehicle flag.
+            self._store.set_card_dirty(self._board, task_id, False)
+            return
         if (
             not post
             or post["thread_id"] is None
@@ -801,7 +920,7 @@ class Consumer:
             store.mark_dead_letter(board, task_id, f"HTTP {err.status} {err.body!r}")
             report.errors.append(f"{task_id}: dead-lettered: {err}")
             return batch_max
-        store.set_card_dirty(board, task_id, True)
+        self._dirty_card_for(task_id, store.get_post(board, task_id))
         report.warnings.append(f"{task_id}: publish failed, will retry: {err}")
         return pos
 
