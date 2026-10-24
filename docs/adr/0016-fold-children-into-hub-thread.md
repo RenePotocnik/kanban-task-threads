@@ -95,6 +95,13 @@ Consequences:
   `Consumer(fold_children=…)`; stored under
   `plugins.entries.kanban-task-threads.settings`.
 
+## Follow-up
+
+ADR-0017 closes the one gap this left: with `fold_children` on, the hub
+thread had no record of the *decomposition itself* — only of the children's
+subsequent lifecycle. It makes `decomposed` a reply-earning kind on the
+root task, listing the children.
+
 ## Rejected
 
 - Folding by default: a behavior change in a published plugin; the

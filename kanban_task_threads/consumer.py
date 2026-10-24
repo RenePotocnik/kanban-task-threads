@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from .render import (
     COMMENTED_EXCERPT_TEMPLATE,
     CONTENT_LIMIT,
+    THREAD_TITLE_LIMIT,
     render_card,
     render_reply,
     render_thread_name,
@@ -46,8 +47,12 @@ from .transport import (
 from .view import build_view
 
 # Which events earn a permanent record in the thread. Not templatable (ADR-0006).
+# `decomposed` is the one topology change in the set (ADR-0017): rare,
+# high-signal, and with fold_children on the only record the hub thread gets
+# of the split.
 DEFAULT_REPLY_ON = (
     "commented",
+    "decomposed",
     "blocked",
     "unblocked",
     "completed",
@@ -449,6 +454,12 @@ class Consumer:
                             payload = {**payload, "excerpt": self._excerpt(body, task_id)}
                             if template is None:
                                 template = COMMENTED_EXCERPT_TEMPLATE
+                    if row["kind"] == "decomposed":
+                        # ADR-0017: the child block is pre-composed into flat
+                        # fields — the formatter (ADR-0006) cannot see the list
+                        # in the payload, and the reply must never fail closed
+                        # on a title lookup.
+                        payload = self._decompose_children(conn, task_id, payload)
                     if not suppress:
                         base = render_reply(row["kind"], payload, template=template)
                         if folded:
@@ -962,6 +973,40 @@ class Consumer:
             (task_id, author, length, event_row["created_at"], event_row["created_at"]),
         ).fetchone()
         return row["body"] if row else None
+
+    def _decompose_children(self, conn, task_id: str, payload: dict) -> dict:
+        """ADR-0017: the `decomposed` reply lists the children. The formatter
+        is flat-only (ADR-0006) and `child_ids` is a list, so the block is
+        pre-composed into scalars: `child_count` (plural carried, so the line
+        reads in the singular too) and one `▸ title · id` line per child —
+        the title collapsed to one line and truncated, the id always kept
+        (ADR-0009), a child already gone from `tasks` degraded to id-only.
+        Payload order is the decompose order; a payload without `child_ids`
+        falls back to `task_links` (children sit on the `parent_id` side —
+        ADR-0012). No children at all: return the payload untouched and let
+        the template fall back to the generic line (ADR-0006) rather than
+        announce a decomposition with an empty list."""
+        ids = payload.get("child_ids")
+        if not (isinstance(ids, list) and ids and all(isinstance(i, str) for i in ids)):
+            ids = [
+                row["parent_id"]
+                for row in conn.execute(
+                    "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY rowid",
+                    (task_id,),
+                )
+            ]
+        if not ids:
+            return payload
+        lines = []
+        for child_id in ids:
+            row = conn.execute("SELECT title FROM tasks WHERE id = ?", (child_id,)).fetchone()
+            title = " ".join((row["title"] if row else "").split())
+            if title:
+                lines.append(f"▸ {truncate(title, THREAD_TITLE_LIMIT)} · {child_id}")
+            else:
+                lines.append(f"▸ {child_id}")
+        count = f"{len(ids)} task{'s' if len(ids) != 1 else ''}"
+        return {**payload, "child_count": count, "children": "\n".join(lines)}
 
     def _excerpt(self, body: str, task_id: str) -> str:
         text = " ".join(body.split())

@@ -7,7 +7,7 @@ against real SQLite fixtures — no network."""
 import pytest
 from conftest import FakeTransport, add_event, insert_task, link_tasks, make_board
 
-from kanban_task_threads.consumer import Consumer
+from kanban_task_threads.consumer import DEFAULT_REPLY_ON, Consumer
 from kanban_task_threads.store import StateStore
 from kanban_task_threads.transport import TransportError
 
@@ -19,9 +19,12 @@ def board(tmp_path):
     return make_board(tmp_path / "kanban.db")
 
 
-def make_parts(tmp_path, board, *, capabilities=None, fold_children=True):
+def make_parts(tmp_path, board, *, capabilities=None, fold_children=True, reply_on=None):
     store = StateStore(tmp_path / "state.db")
     transport = FakeTransport(capabilities=capabilities)
+    kwargs = {}
+    if reply_on is not None:
+        kwargs["reply_on"] = tuple(reply_on)
     consumer = Consumer(
         tmp_path / "kanban.db",
         store,
@@ -30,6 +33,7 @@ def make_parts(tmp_path, board, *, capabilities=None, fold_children=True):
         holder="p1",
         guild_id="9",
         fold_children=fold_children,
+        **kwargs,
     )
     return store, transport, consumer
 
@@ -93,18 +97,19 @@ def test_child_folds_into_epic_thread(board, tmp_path):
     # Epic row is the owner of itself.
     assert store.get_post("default", "t_epic")["owner_task_id"] == "t_epic"
 
-    # No card edit for a subtask: they have no card. The epic's repaint is
-    # deferred: it was in this pass's event batch, so the dirty vehicle
-    # (which skips in-batch tasks) fires on the NEXT pass instead.
-    assert transport.ops("edit_card") == []
+    # The epic's own `decomposed` reply (ADR-0017) refreshes its card in the
+    # open pass; a subtask has no card of its own to edit.
+    edits = transport.ops("edit_card")
+    assert len(edits) == 1
+    assert edits[0][1].thread_id == epic_thread
     # The card opened in pass 1 already carries the rollup — the children were
     # done before the thread existed, so it never rendered without them.
     assert "2 done" in opens[0][2].description
     consumer.run_once(now=NOW + 10)
     edits = transport.ops("edit_card")
-    assert len(edits) == 1
-    assert edits[0][1].thread_id == epic_thread
-    assert "2 done" in edits[0][2].description
+    assert len(edits) == 2
+    assert edits[1][1].thread_id == epic_thread
+    assert "2 done" in edits[1][2].description
 
 
 def test_second_pass_is_silent_when_folded(board, tmp_path):
@@ -137,23 +142,28 @@ def test_child_events_before_hub_hold(board, tmp_path):
     assert report.errors == []
     assert store.get_post("default", "t_s0") is None  # not attached, not lost
 
-    # Now the epic's events land: it opens, the child STILL holds (it is
-    # processed first — lower event ids — before the epic's row exists
-    # this pass).
+    # Now the epic's events land: it opens, its `decomposed` reply goes out
+    # (ADR-0017), and the child STILL holds (it is processed first — lower
+    # event ids — before the epic's row exists this pass).
     add_event(board, "t_epic", "created", {"status": "ready"})
     add_event(board, "t_epic", "decomposed", {"child_ids": ["t_s0"]})
     report = consumer.run_once(now=NOW + 10)
     assert not report.errors
     assert len(transport.ops("open_thread")) == 1
     assert store.get_post("default", "t_s0") is None
+    (append,) = transport.ops("append")
+    assert append[1].thread_id == "th1"
+    assert append[2].startswith("🧩 decomposed into 1 task:")
+    assert "▸ subtask 0 · t_s0" in append[2]
 
     # Next pass: the child attaches and its held events publish into th1.
     report = consumer.run_once(now=NOW + 20)
     assert not report.errors
-    (append,) = transport.ops("append")
-    assert append[1].thread_id == "th1"
-    assert append[2].startswith("▸ subtask 0 · t_s0")
-    assert "sub 0 done" in append[2]
+    appends = transport.ops("append")
+    assert len(appends) == 2
+    assert appends[1][1].thread_id == "th1"
+    assert appends[1][2].startswith("▸ subtask 0 · t_s0")
+    assert "sub 0 done" in appends[1][2]
 
 
 def test_multiple_topmost_dependents_keep_own_thread(board, tmp_path):
@@ -217,7 +227,15 @@ def test_hub_tombstone_cascades_to_child(board, tmp_path):
 
 
 def test_429_backs_off_the_child_only(board, tmp_path):
-    store, transport, consumer = make_parts(tmp_path, board)
+    """A 429 on a child's reply backs off that child only — never the hub,
+    never a sibling. `decomposed` is dropped from reply_on so this pass's
+    appends are the children's own (the epic's announcement is
+    test_decompose_reply's concern, not this one)."""
+    store, transport, consumer = make_parts(
+        tmp_path,
+        board,
+        reply_on=[kind for kind in DEFAULT_REPLY_ON if kind != "decomposed"],
+    )
     epic_with_subtasks(board, sub_events=("created", "completed"))
     transport.queue_error("append", TransportError(429, {"retry_after": 7}))
     consumer.run_once(now=NOW)
@@ -318,8 +336,12 @@ def test_announce_skips_dependent_folded_into_this_thread(board, tmp_path):
     store.begin_create("default", "X", now=now)
     store.complete_create("default", "X", thread_id="thX", message_id="msgX", destination="d")
     store.attach_folded(
-        "default", "D", thread_id="thX", message_id="msgX",
-        destination="d", owner_task_id="X",
+        "default",
+        "D",
+        thread_id="thX",
+        message_id="msgX",
+        destination="d",
+        owner_task_id="X",
     )
     store.begin_create("default", "E", now=now)
     store.complete_create("default", "E", thread_id="thE", message_id="msgE", destination="d")

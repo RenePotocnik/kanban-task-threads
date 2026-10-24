@@ -27,6 +27,7 @@ which kinds additionally earn a permanent reply (the default `reply_on` set).
 | `timed_out` | ⏱️ yes | board (unsigned) | |
 | `reclaimed` | ♻️ yes | board (unsigned) | Stale-claim reclaim; the card returns to a non-running state |
 | `archived` | 📦 yes | board (unsigned) | `archive_task` fires no hook either; payload is `None` |
+| `decomposed` | 🧩 yes | board (unsigned) | Payload `child_ids` pre-composed into a `▸ title · id` block — one line per child, title truncated, id always kept, a child already deleted degrades to id-only; a payload without `child_ids` falls back to `task_links` (ADR-0017). One reply per decomposition, in the root's own thread — with `fold_children` on the only record of the split |
 | `assigned`, `promoted`, `promoted_manual`, `claimed`, `claim_rejected`, `dependency_wait`, `edited`, `attached`, `attachment_removed`, `unlinked`, `review_reopened`, `descendant_invalidated`, `status`, `specified`, `scheduled`, `spawned` | — | Card refresh only. Any of them can be added to `reply_on` |
 
 Rules that are event-shaped rather than kind-shaped:

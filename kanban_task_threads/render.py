@@ -50,6 +50,7 @@ DEFAULT_CARD_TEMPLATE = (
 # lacks the value) so no template ever renders a dangling "— " or ": ".
 DEFAULT_REPLY_TEMPLATES = {
     "commented": "💬 {author} commented",
+    "decomposed": "🧩 decomposed into {child_count}:\n{children}",
     "blocked": "⛔ blocked (`{kind}`){reason_part}",
     "unblocked": "✅ unblocked",
     "completed": "🏁 completed{summary_part}",
