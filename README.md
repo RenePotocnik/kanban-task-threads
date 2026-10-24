@@ -21,6 +21,42 @@ signed with the webhook's own name — deliberately: a webhook message's
 username is fixed at creation, so signing the card with an assignee would
 freeze the first one forever (see [docs/transport.md](docs/transport.md)).
 
+## What this fork adds
+
+Fork of [diegomarino/kanban-task-threads](https://github.com/diegomarino/kanban-task-threads)
+(upstream, vanilla behavior). Two additions change how decompositions are
+published; both are specified in
+[ADR-0016](docs/adr/0016-fold-children-into-hub-thread.md) and
+[ADR-0017](docs/adr/0017-decompose-announcement.md).
+
+**Hub-thread folding (`fold_children`, ADR-0016).** Upstream, every task gets
+its own thread — a decomposition turns one piece of work into a pile of
+threads. With `fold_children: true` (opt-in, default `false`), a decomposed
+child no longer opens its own thread: its updates attach to the thread of its
+**topmost dependent** — the root of the decomposition tree — and post there,
+each reply prefixed with the child's label (`▸ title · id`) so several
+children in one thread stay attributable. The root's own events still open and
+drive the thread, and its card remains the only card in it — the status tag,
+rename and archive follow the root's status, not the children's. Routing is
+transitive (multi-level decompositions land in the grand epic's thread), and
+ambiguity falls back to the child's own thread rather than duplicating a reply
+into several: a child gating multiple topmost dependents (shared fan-in) or
+a link cycle keeps its own thread.
+
+**Decomposition announcements (`decomposed`, ADR-0017).** When a task is
+split, the board writes a `decomposed` event on it. This fork publishes that
+event as one unsigned reply in the root's own thread — the hub itself, so no
+folding is involved and it works with `fold_children` on or off — listing
+what the task was decomposed into:
+
+> 🧩 decomposed into 2 tasks:
+> ▸ Debug: existing schedules… · t_d5bdb6b0
+> ▸ Debug: new lesson time… · t_bba2dfbb
+
+`decomposed` joins the default `reply_on` set (it is a topology change, not a
+status flap). Drop it from `reply_on` to return to silence; override its
+wording through `reply_templates`.
+
 ## Requirements
 
 - Hermes 0.20+ with the kanban board in use.
@@ -62,6 +98,20 @@ including tests, CI and documentation — before installing it:
 hermes plugins install diegomarino/kanban-task-threads
 hermes plugins enable kanban-task-threads
 ```
+
+To install **this fork** — with the hub-thread folding above — install it
+under its own name:
+
+```bash
+hermes plugins install RenePotocnik/kanban-task-threads
+hermes plugins enable kanban-task-threads
+```
+
+Which source you install from is the provenance the updater uses later: a
+fork install pulls `--ff-only` from the fork's remote (local edits
+autostash), while a *catalog* install re-pins to the reviewed upstream SHA —
+which would drop this fork's commits. Install the fork if you want its
+behavior to survive `hermes plugins update`.
 
 If a future revision reports `CAUTION`, review every finding before repeating
 the command with `--force`; that flag cannot override a `DANGEROUS` verdict.
